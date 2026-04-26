@@ -39,15 +39,15 @@ jobs:
         shell: powershell
         run: |
           dir
-          if (!(Test-Path "video_scene_splitter.py.py")) {
-            Write-Error "Cannot find video_scene_splitter.py.py"
+          if (!(Test-Path "video_scene_splitter.py")) {
+            Write-Error "Cannot find video_scene_splitter.py"
             exit 1
           }
 
       - name: Build EXE with PyInstaller
         shell: powershell
         run: |
-          pyinstaller --onefile --windowed --name VideoSceneSplitter "video_scene_splitter.py.py"
+          pyinstaller --onefile --windowed --name VideoSceneSplitter "video_scene_splitter.py"
 
       - name: Check EXE file
         shell: powershell
