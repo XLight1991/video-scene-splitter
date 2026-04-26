@@ -1,10 +1,10 @@
+import os
 import sys
 import shlex
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QProcess, Signal
 from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,27 +28,68 @@ from PySide6.QtWidgets import (
 )
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm", ".ts"}
+SCENEDETECT_INTERNAL_FLAG = "--run-scenedetect-cli"
+
+
+def is_frozen_app() -> bool:
+    """判断当前程序是否为 PyInstaller 打包后的 exe。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+def run_embedded_scenedetect(args: list[str]) -> int:
+    """
+    exe 内部隐藏运行 PySceneDetect CLI。
+
+    本地源码运行时，原逻辑是：
+        python -m scenedetect ...
+
+    打包成 exe 后，sys.executable 会变成当前 exe 自己。
+    所以不能继续普通方式调用：
+        VideoSceneSplitter.exe -m scenedetect ...
+
+    正确做法是：
+        VideoSceneSplitter.exe --run-scenedetect-cli ...
+
+    然后在这里导入 PySceneDetect 的官方 CLI 入口，让它继续执行原来的：
+        scenedetect -i xxx.mp4 -m 1.000s detect-content -t 27 split-video -o output
+    """
+    original_argv = sys.argv[:]
+
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+    try:
+        from scenedetect.__main__ import main as scenedetect_main
+
+        sys.argv = ["scenedetect", *args]
+        scenedetect_main()
+        return 0
+
+    except SystemExit as exc:
+        code = exc.code
+
+        if code is None:
+            return 0
+
+        if isinstance(code, int):
+            return code
+
+        print(code)
+        return 1
+
+    except Exception as exc:
+        print(f"[ERROR] PySceneDetect failed: {exc}")
+        return 1
+
+    finally:
+        sys.argv = original_argv
 
 
 def is_video_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in VIDEO_EXTS
-
-
-def quote_cmd(parts: list[str]) -> str:
-    return " ".join(shlex.quote(str(x)) for x in parts)
-
-
-def check_ffmpeg_available() -> bool:
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
 
 
 class VideoListWidget(QListWidget):
@@ -126,219 +167,29 @@ class Job:
     out_dir: str
 
 
-class VideoSplitWorker(QThread):
-    log = Signal(str)
-    progress = Signal(int)
-    finished_all = Signal()
-    failed = Signal(str)
-
-    def __init__(
-        self,
-        jobs: list[Job],
-        detector: str,
-        threshold: float,
-        min_scene_seconds: float,
-    ):
-        super().__init__()
-        self.jobs = jobs
-        self.detector = detector
-        self.threshold = threshold
-        self.min_scene_seconds = min_scene_seconds
-        self._stop_requested = False
-        self._current_process: subprocess.Popen | None = None
-
-    def stop(self):
-        self._stop_requested = True
-        if self._current_process and self._current_process.poll() is None:
-            try:
-                self._current_process.terminate()
-            except Exception:
-                pass
-
-    def run(self):
-        try:
-            import cv2
-            from scenedetect import SceneManager, open_video
-            from scenedetect.detectors import ContentDetector, ThresholdDetector
-        except Exception as exc:
-            self.failed.emit(f"无法导入依赖：{exc}")
-            return
-
-        total = len(self.jobs)
-
-        for index, job in enumerate(self.jobs, start=1):
-            if self._stop_requested:
-                self.log.emit("========== 已停止 ==========")
-                self.finished_all.emit()
-                return
-
-            video_path = Path(job.video_path)
-            out_sub = Path(job.out_dir) / video_path.stem
-            out_sub.mkdir(parents=True, exist_ok=True)
-
-            self.log.emit("")
-            self.log.emit(f"[{index}/{total}] 处理：{video_path.name}")
-            self.log.emit(f"输出：{out_sub}")
-
-            try:
-                fps = self._get_video_fps(video_path, cv2)
-                min_scene_len = max(1, int(round(self.min_scene_seconds * fps)))
-
-                self.log.emit(
-                    f"检测参数：detector={self.detector}, threshold={self.threshold:.3f}, "
-                    f"min_scene={self.min_scene_seconds:.3f}s, fps={fps:.3f}, min_scene_len={min_scene_len} frames"
-                )
-
-                video = open_video(str(video_path))
-                scene_manager = SceneManager()
-
-                if self.detector == "content":
-                    scene_manager.add_detector(
-                        ContentDetector(
-                            threshold=self.threshold,
-                            min_scene_len=min_scene_len,
-                        )
-                    )
-                elif self.detector == "threshold":
-                    scene_manager.add_detector(
-                        ThresholdDetector(
-                            threshold=self.threshold,
-                            min_scene_len=min_scene_len,
-                        )
-                    )
-                else:
-                    raise ValueError(f"未知检测器：{self.detector}")
-
-                self.log.emit("正在检测镜头边界...")
-                scene_manager.detect_scenes(video)
-                scene_list = scene_manager.get_scene_list()
-
-                if not scene_list:
-                    self.log.emit("[i] 未检测到明显镜头切换，将整个视频作为一个片段处理。")
-                    duration = self._get_video_duration(video_path, cv2)
-                    scene_ranges = [(0.0, duration)]
-                else:
-                    scene_ranges = [
-                        (start.get_seconds(), end.get_seconds())
-                        for start, end in scene_list
-                    ]
-
-                self.log.emit(f"检测完成，共 {len(scene_ranges)} 个片段。")
-                self._split_with_ffmpeg(video_path, out_sub, scene_ranges)
-
-            except Exception as exc:
-                self.log.emit(f"[!] 处理失败：{exc}")
-
-            self.progress.emit(int((index / total) * 100))
-
-        self.log.emit("========== 全部完成 ✅ ==========")
-        self.finished_all.emit()
-
-    def _get_video_fps(self, video_path: Path, cv2_module) -> float:
-        cap = cv2_module.VideoCapture(str(video_path))
-        fps = cap.get(cv2_module.CAP_PROP_FPS)
-        cap.release()
-
-        if not fps or fps <= 0:
-            return 25.0
-
-        return float(fps)
-
-    def _get_video_duration(self, video_path: Path, cv2_module) -> float:
-        cap = cv2_module.VideoCapture(str(video_path))
-        fps = cap.get(cv2_module.CAP_PROP_FPS)
-        frames = cap.get(cv2_module.CAP_PROP_FRAME_COUNT)
-        cap.release()
-
-        if not fps or fps <= 0 or not frames or frames <= 0:
-            return 0.0
-
-        return float(frames / fps)
-
-    def _split_with_ffmpeg(
-        self,
-        video_path: Path,
-        out_sub: Path,
-        scene_ranges: list[tuple[float, float]],
-    ):
-        for scene_index, (start_sec, end_sec) in enumerate(scene_ranges, start=1):
-            if self._stop_requested:
-                return
-
-            if end_sec <= start_sec:
-                continue
-
-            output_file = out_sub / f"{video_path.stem}_scene_{scene_index:03d}{video_path.suffix}"
-
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                str(video_path),
-                "-ss",
-                f"{start_sec:.3f}",
-                "-to",
-                f"{end_sec:.3f}",
-                "-c",
-                "copy",
-                str(output_file),
-            ]
-
-            self.log.emit("FFmpeg： " + quote_cmd(cmd))
-
-            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-
-            self._current_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-                creationflags=creationflags,
-            )
-
-            if self._current_process.stdout:
-                for line in self._current_process.stdout:
-                    line = line.rstrip()
-                    if line:
-                        self.log.emit(line)
-
-            return_code = self._current_process.wait()
-            self._current_process = None
-
-            if return_code == 0:
-                self.log.emit(f"[✓] 已输出：{output_file.name}")
-            else:
-                self.log.emit(f"[!] FFmpeg 退出码：{return_code}")
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-
         self.setWindowTitle("Video Scene Splitter")
         self.resize(980, 720)
 
-        self.worker: VideoSplitWorker | None = None
+        self.jobs: list[Job] = []
+        self.current_job_index = -1
+        self.user_stopped = False
 
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
 
         info = QLabel(
-            "拖拽视频到列表；拖拽输出文件夹到路径框；点击开始后将按画面/镜头变化切分视频。\n"
-            "需要：程序包含 PySceneDetect / OpenCV；系统需要安装 FFmpeg，并确保 ffmpeg 命令可用。"
+            "拖拽视频到列表；拖拽输出文件夹到路径框；点击开始后将按镜头切分。\n"
+            "需要：程序已包含 PySceneDetect / OpenCV，且系统 PATH 中有 ffmpeg。"
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
         list_box = QGroupBox("视频列表（可拖拽多个视频/文件夹进来）")
         list_layout = QVBoxLayout(list_box)
-
         self.video_list = VideoListWidget()
         list_layout.addWidget(self.video_list)
 
@@ -346,12 +197,10 @@ class MainWindow(QMainWindow):
         self.btn_add = QPushButton("添加视频…")
         self.btn_remove = QPushButton("移除选中")
         self.btn_clear = QPushButton("清空")
-
         btn_row.addWidget(self.btn_add)
         btn_row.addWidget(self.btn_remove)
         btn_row.addWidget(self.btn_clear)
         btn_row.addStretch(1)
-
         list_layout.addLayout(btn_row)
         layout.addWidget(list_box)
 
@@ -361,10 +210,8 @@ class MainWindow(QMainWindow):
         out_row = QHBoxLayout()
         self.out_edit = FolderLineEdit()
         self.btn_out = QPushButton("选择输出文件夹…")
-
         out_row.addWidget(self.out_edit, 1)
         out_row.addWidget(self.btn_out)
-
         cfg_layout.addRow("输出文件夹：", out_row)
 
         self.detector_combo = QComboBox()
@@ -389,11 +236,9 @@ class MainWindow(QMainWindow):
         self.btn_start = QPushButton("开始处理")
         self.btn_stop = QPushButton("停止")
         self.btn_stop.setEnabled(False)
-
         ctrl_row.addWidget(self.btn_start)
         ctrl_row.addWidget(self.btn_stop)
         ctrl_row.addStretch(1)
-
         layout.addLayout(ctrl_row)
 
         self.progress = QProgressBar()
@@ -404,6 +249,11 @@ class MainWindow(QMainWindow):
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         layout.addWidget(self.log, 1)
+
+        self.proc = QProcess(self)
+        self.proc.setProcessChannelMode(QProcess.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(self._on_proc_output)
+        self.proc.finished.connect(self._on_proc_finished)
 
         self.btn_add.clicked.connect(self.add_videos_dialog)
         self.btn_remove.clicked.connect(self.remove_selected)
@@ -466,8 +316,38 @@ class MainWindow(QMainWindow):
         if directory:
             self.out_edit.setText(directory)
 
+    def _check_runtime_dependencies(self) -> bool:
+        try:
+            import scenedetect  # noqa: F401
+            import cv2  # noqa: F401
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "缺少依赖",
+                f"当前程序无法导入 scenedetect / opencv：\n{exc}",
+            )
+            return False
+
+        ffmpeg_proc = QProcess(self)
+        ffmpeg_proc.start("ffmpeg", ["-version"])
+
+        if not ffmpeg_proc.waitForStarted(1500):
+            QMessageBox.critical(
+                self,
+                "缺少 ffmpeg",
+                "无法启动 ffmpeg。\n\n"
+                "请先安装 ffmpeg，并确保 ffmpeg.exe 已加入系统 PATH。\n\n"
+                "可以在命令行运行下面命令测试：\n"
+                "ffmpeg -version",
+            )
+            return False
+
+        ffmpeg_proc.kill()
+        ffmpeg_proc.waitForFinished(1000)
+        return True
+
     def start_all(self):
-        if self.worker and self.worker.isRunning():
+        if self.proc.state() != QProcess.NotRunning:
             return
 
         videos = self._all_video_paths()
@@ -480,59 +360,155 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请设置输出文件夹。")
             return
 
-        if not check_ffmpeg_available():
-            QMessageBox.critical(
-                self,
-                "缺少 FFmpeg",
-                "无法启动 FFmpeg。\n\n"
-                "请先安装 FFmpeg，并确保 ffmpeg.exe 已加入系统 PATH。\n\n"
-                "可以在命令行运行下面命令测试：\n"
-                "ffmpeg -version",
-            )
+        if not self._check_runtime_dependencies():
             return
 
         out_path = Path(out_dir).expanduser().resolve()
         out_path.mkdir(parents=True, exist_ok=True)
 
-        jobs = [Job(video_path=v, out_dir=str(out_path)) for v in videos]
-
-        self.worker = VideoSplitWorker(
-            jobs=jobs,
-            detector=self.detector_combo.currentText().strip(),
-            threshold=self.threshold_spin.value(),
-            min_scene_seconds=self.min_scene_spin.value(),
-        )
-
-        self.worker.log.connect(self.append_log)
-        self.worker.progress.connect(self.progress.setValue)
-        self.worker.finished_all.connect(self._on_worker_finished)
-        self.worker.failed.connect(self._on_worker_failed)
+        self.jobs = [Job(video_path=v, out_dir=str(out_path)) for v in videos]
+        self.current_job_index = -1
+        self.user_stopped = False
 
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.progress.setValue(0)
-
         self.append_log("========== 开始批处理 ==========")
-        self.worker.start()
+        self._start_next_job()
 
     def stop_all(self):
-        if self.worker and self.worker.isRunning():
-            self.append_log("[!] 正在停止当前任务…")
-            self.worker.stop()
-        else:
-            self._on_worker_finished()
+        self.user_stopped = True
 
-    def _on_worker_finished(self):
+        if self.proc.state() != QProcess.NotRunning:
+            self.append_log("[!] 正在停止当前任务…")
+            self.proc.kill()
+        else:
+            self._reset_after_stop()
+            self.append_log("========== 已停止 ==========")
+
+    def _reset_after_stop(self):
+        self.jobs = []
+        self.current_job_index = -1
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self.progress.setValue(0)
 
-    def _on_worker_failed(self, message: str):
-        QMessageBox.critical(self, "错误", message)
-        self.append_log("[x] " + message)
-        self._on_worker_finished()
+    def _build_command(self, video_path: Path, out_sub: Path) -> list[str]:
+        detector = self.detector_combo.currentText().strip()
+        threshold = self.threshold_spin.value()
+        min_scene = self.min_scene_spin.value()
+
+        scenedetect_args = [
+            "-i",
+            str(video_path),
+            "-m",
+            f"{min_scene:.3f}s",
+        ]
+
+        if detector == "content":
+            scenedetect_args += ["detect-content", "-t", f"{threshold:.3f}"]
+        elif detector == "threshold":
+            scenedetect_args += ["detect-threshold", "-t", f"{threshold:.3f}"]
+        else:
+            raise ValueError(f"未知检测器: {detector}")
+
+        scenedetect_args += ["split-video", "-o", str(out_sub)]
+
+        if is_frozen_app():
+            cmd = [
+                sys.executable,
+                SCENEDETECT_INTERNAL_FLAG,
+                *scenedetect_args,
+            ]
+        else:
+            cmd = [
+                sys.executable,
+                "-m",
+                "scenedetect",
+                *scenedetect_args,
+            ]
+
+        return cmd
+
+    def _start_next_job(self):
+        if self.user_stopped:
+            self._reset_after_stop()
+            return
+
+        self.current_job_index += 1
+
+        if self.current_job_index >= len(self.jobs):
+            self.append_log("========== 全部完成 ✅ ==========")
+            self.btn_start.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+            self.progress.setValue(100)
+            self.jobs = []
+            self.current_job_index = -1
+            return
+
+        job = self.jobs[self.current_job_index]
+        video_path = Path(job.video_path)
+        out_sub = Path(job.out_dir) / video_path.stem
+        out_sub.mkdir(parents=True, exist_ok=True)
+
+        try:
+            cmd = self._build_command(video_path, out_sub)
+        except Exception as exc:
+            QMessageBox.critical(self, "错误", f"构造命令失败：\n{exc}")
+            self.stop_all()
+            return
+
+        self.append_log("")
+        self.append_log(f"[{self.current_job_index + 1}/{len(self.jobs)}] 处理：{video_path.name}")
+        self.append_log(f"输出：{out_sub}")
+        self.append_log("命令： " + " ".join(shlex.quote(x) for x in cmd))
+
+        self.proc.start(cmd[0], cmd[1:])
+
+        if not self.proc.waitForStarted(3000):
+            QMessageBox.critical(
+                self,
+                "错误",
+                "无法启动 scenedetect。\n\n"
+                "如果运行的是 exe，请确认程序没有被杀毒软件拦截。\n"
+                "如果运行的是源码，请确认当前 Python 环境已安装 scenedetect。",
+            )
+            self.stop_all()
+
+    def _on_proc_output(self):
+        data = self.proc.readAllStandardOutput().data().decode(errors="ignore")
+        if data:
+            self.append_log(data.rstrip("\n"))
+
+    def _on_proc_finished(self, exit_code: int, exit_status: QProcess.ExitStatus):
+        if self.user_stopped:
+            self.append_log("========== 已停止 ==========")
+            self._reset_after_stop()
+            self.user_stopped = False
+            return
+
+        if self.jobs:
+            done = self.current_job_index + 1
+            total = len(self.jobs)
+            self.progress.setValue(int((done / total) * 100))
+
+        if exit_status == QProcess.CrashExit:
+            self.append_log(f"[x] 任务崩溃退出（exit_code={exit_code}）")
+        elif exit_code == 0:
+            self.append_log("[✓] 完成")
+        else:
+            self.append_log(
+                f"[!] 退出码 {exit_code}（可能是 ffmpeg/scenedetect 参数问题，或视频文件损坏）"
+            )
+
+        self._start_next_job()
 
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == SCENEDETECT_INTERNAL_FLAG:
+        exit_code = run_embedded_scenedetect(sys.argv[2:])
+        sys.exit(exit_code)
+
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
